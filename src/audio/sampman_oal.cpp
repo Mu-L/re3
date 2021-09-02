@@ -92,7 +92,7 @@ OggOpusFile *fpSampleDataHandle;
 #else
 FILE *fpSampleDataHandle;
 #endif
-bool8 bSampleBankLoaded            [MAX_SFX_BANKS];
+int8  gBankLoaded                  [MAX_SFX_BANKS];
 int32 nSampleBankDiscStartOffset   [MAX_SFX_BANKS];
 int32 nSampleBankSize              [MAX_SFX_BANKS];
 uintptr nSampleBankMemoryStartAddress[MAX_SFX_BANKS];
@@ -781,7 +781,7 @@ cSampleManager::Initialise(void)
 		
 		for ( int32 i = 0; i < MAX_SFX_BANKS; i++ )
 		{
-			bSampleBankLoaded[i]             = FALSE;
+			gBankLoaded[i]                   = LOADING_STATUS_NOT_LOADED;
 			nSampleBankDiscStartOffset[i]    = 0;
 			nSampleBankSize[i]               = 0;
 			nSampleBankMemoryStartAddress[i] = 0;
@@ -1194,7 +1194,7 @@ cSampleManager::LoadSampleBank(uint8 nBank)
 	if ( fread((void *)nSampleBankMemoryStartAddress[nBank], 1, nSampleBankSize[nBank], fpSampleDataHandle) != nSampleBankSize[nBank] )
 		return FALSE;
 #endif
-	bSampleBankLoaded[nBank] = TRUE;
+	gBankLoaded[nBank] = LOADING_STATUS_LOADED;
 	
 	return TRUE;
 }
@@ -1204,18 +1204,18 @@ cSampleManager::UnloadSampleBank(uint8 nBank)
 {
 	ASSERT( nBank < MAX_SFX_BANKS);
 	
-	bSampleBankLoaded[nBank] = FALSE;
+	gBankLoaded[nBank] = LOADING_STATUS_NOT_LOADED;
 }
 
-bool8
+int8
 cSampleManager::IsSampleBankLoaded(uint8 nBank)
 {
 	ASSERT( nBank < MAX_SFX_BANKS);
 	
-	return bSampleBankLoaded[nBank];
+	return gBankLoaded[nBank];
 }
 
-bool8
+uint8
 cSampleManager::IsPedCommentLoaded(uint32 nComment)
 {
 	ASSERT( nComment < TOTAL_AUDIO_SAMPLES );
@@ -1230,10 +1230,10 @@ cSampleManager::IsPedCommentLoaded(uint32 nComment)
 		uint8 slot = nCurrentPedSlot - i - 1;
 #endif
 		if ( nComment == nPedSlotSfx[slot] )
-			return TRUE;
+			return LOADING_STATUS_LOADED;
 	}
 	
-	return FALSE;
+	return LOADING_STATUS_NOT_LOADED;
 }
 
 
@@ -1327,14 +1327,14 @@ cSampleManager::GetBankContainingSound(uint32 offset)
 	return INVALID_SFX_BANK;
 }
 
-int32
+uint32
 cSampleManager::GetSampleBaseFrequency(uint32 nSample)
 {
 	ASSERT( nSample < TOTAL_AUDIO_SAMPLES );
 	return m_aSamples[nSample].nFrequency;
 }
 
-int32
+uint32
 cSampleManager::GetSampleLoopStartOffset(uint32 nSample)
 {
 	ASSERT( nSample < TOTAL_AUDIO_SAMPLES );
@@ -1362,10 +1362,16 @@ bool8 cSampleManager::UpdateReverb(void)
 
 	if ( AudioManager.m_FrameCounter & 15 )
 		return FALSE;
-			
+
+#ifdef AUDIO_REFLECTIONS
 	float y = AudioManager.m_afReflectionsDistances[REFLECTION_TOP]  + AudioManager.m_afReflectionsDistances[REFLECTION_BOTTOM];
 	float x = AudioManager.m_afReflectionsDistances[REFLECTION_LEFT] + AudioManager.m_afReflectionsDistances[REFLECTION_RIGHT];
 	float z = AudioManager.m_afReflectionsDistances[REFLECTION_UP];
+#else
+	float x = 0.0f;
+	float y = 0.0f;
+	float z = 0.0f;
+#endif
 	
 	float normy = norm(y, 5.0f, 40.0f);
 	float normx = norm(x, 5.0f, 40.0f);
@@ -1455,11 +1461,23 @@ cSampleManager::InitialiseChannel(uint32 nChannel, uint32 nSfx, uint8 nBank)
 	}
 	else
 	{
-		if ( !IsPedCommentLoaded(nSfx) )
+		int32 i;
+		for ( i = 0; i < _TODOCONST(3); i++ )
+		{
+			int32 slot = nCurrentPedSlot - i - 1;
+#ifdef FIX_BUGS
+			if (slot < 0)
+				slot += ARRAY_SIZE(nPedSlotSfx);
+#endif
+			if ( nSfx == nPedSlotSfx[slot] )
+			{
+				addr = (nSampleBankMemoryStartAddress[SFX_BANK_PED_COMMENTS] + PED_BLOCKSIZE * slot);
+				break;
+			}
+		}
+
+		if (i == _TODOCONST(3))
 			return FALSE;
-		
-		int32 slot = _GetPedCommentSlot(nSfx);
-		addr = (nSampleBankMemoryStartAddress[SFX_BANK_PED_COMMENTS] + PED_BLOCKSIZE * slot);
 	}
 	
 	if ( GetChannelUsedFlag(nChannel) )
@@ -1653,7 +1671,7 @@ cSampleManager::StartPreloadedStreamedFile(uint8 nStream)
 bool8
 cSampleManager::StartStreamedFile(uint8 nFile, uint32 nPos, uint8 nStream)
 {
-	int i = 0;
+	uint32 i = 0;
 	uint32 position = nPos;
 	char filename[MAX_PATH];
 
@@ -1728,7 +1746,7 @@ cSampleManager::StartStreamedFile(uint8 nFile, uint32 nPos, uint8 nStream)
 					if ( !_pMP3List )
 					{
 						nFile = 0;
-						_bIsMp3Active = 0;
+						_bIsMp3Active = FALSE;
 						CStream *stream = aStream[nStream];
 #ifdef PS2_AUDIO_PATHS
 						if(!stream->Open(PS2StreamedNameTable[nFile], IsThisTrackAt16KHz(nFile) ? 16000 : 32000))
@@ -1767,7 +1785,7 @@ cSampleManager::StartStreamedFile(uint8 nFile, uint32 nPos, uint8 nStream)
 				}
 
 			}
-			_bIsMp3Active = 0;
+			_bIsMp3Active = FALSE;
 		}
 		while ( ++i < nNumMP3s );
 		position = 0;

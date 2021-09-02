@@ -8,8 +8,6 @@
 #include "SurfaceTable.h"
 #include "sampman.h"
 
-const int CollisionSoundIntensity = 60;
-
 void
 cAudioManager::ReportCollision(CEntity *entity1, CEntity *entity2, uint8 surface1, uint8 surface2, float collisionPower,
                                float velocity)
@@ -18,7 +16,7 @@ cAudioManager::ReportCollision(CEntity *entity1, CEntity *entity2, uint8 surface
 	CVector v1;
 	CVector v2;
 
-	if(!m_bIsInitialised || m_nCollisionEntity < 0 || m_nUserPause ||
+	if(!m_bIsInitialised || m_nCollisionEntity < 0 || m_bIsPaused ||
 	   (velocity < 0.0016f && collisionPower < 0.01f))
 		return;
 
@@ -32,7 +30,7 @@ cAudioManager::ReportCollision(CEntity *entity1, CEntity *entity2, uint8 surface
 	}
 	CVector pos = (v1 + v2) * 0.5f;
 	distSquared = GetDistanceSquared(pos);
-	if(distSquared < SQR(CollisionSoundIntensity)) {
+	if(distSquared < SQR(COLLISION_MAX_DIST)) {
 		m_sCollisionManager.m_sQueue.m_pEntity1 = entity1;
 		m_sCollisionManager.m_sQueue.m_pEntity2 = entity2;
 		m_sCollisionManager.m_sQueue.m_bSurface1 = surface1;
@@ -48,8 +46,8 @@ cAudioManager::ReportCollision(CEntity *entity1, CEntity *entity2, uint8 surface
 void
 cAudioCollisionManager::AddCollisionToRequestedQueue()
 {
-	int32 collisionsIndex;
-	int32 i;
+	uint32 collisionsIndex;
+	uint32 i;
 
 
 	if (m_bCollisionsInQueue < NUMAUDIOCOLLISIONS)
@@ -139,7 +137,7 @@ cAudioManager::ServiceCollisions()
 	m_sCollisionManager.m_bCollisionsInQueue = 0;
 }
 
-static const int32 gOneShotCol[] = {SFX_COL_TARMAC_1,
+static const uint32 gOneShotCol[] = {SFX_COL_TARMAC_1,
                                     SFX_COL_TARMAC_1,
                                     SFX_COL_GRASS_1,
                                     SFX_COL_GRAVEL_1,
@@ -179,7 +177,7 @@ cAudioManager::SetUpOneShotCollisionSound(const cAudioCollision &col)
 	uint16 s1;
 	uint16 s2;
 
-	int32 emittingVol;
+	uint32 emittingVol;
 	float ratio;
 
 	static uint16 counter = 28;
@@ -198,12 +196,12 @@ cAudioManager::SetUpOneShotCollisionSound(const cAudioCollision &col)
 			s1 = SURFACE_CAR_PANEL;
 			ratio = Min(1.f, 2.f * ratio);
 		}
-		emittingVol = 40.f * ratio;
+		emittingVol = 40 * ratio;
 		if(emittingVol) {
 			m_sQueueSample.m_fDistance = Sqrt(col.m_fDistance);
 			m_sQueueSample.m_nVolume =
-			    ComputeVolume(emittingVol, CollisionSoundIntensity, m_sQueueSample.m_fDistance);
-			if(m_sQueueSample.m_nVolume) {
+			    ComputeVolume(emittingVol, COLLISION_MAX_DIST, m_sQueueSample.m_fDistance);
+			if(m_sQueueSample.m_nVolume > 0) {
 				m_sQueueSample.m_nSampleIndex = gOneShotCol[s1];
 				switch(m_sQueueSample.m_nSampleIndex) {
 				case SFX_COL_TARMAC_1:
@@ -261,15 +259,15 @@ cAudioManager::SetUpOneShotCollisionSound(const cAudioCollision &col)
 				m_sQueueSample.m_vecPos = col.m_vecPosition;
 				m_sQueueSample.m_nBankIndex = SFX_BANK_0;
 				m_sQueueSample.m_bIs2D = FALSE;
-				m_sQueueSample.m_nReleasingVolumeModificator = 11;
+				m_sQueueSample.m_nPriority = 11;
 				m_sQueueSample.m_nLoopCount = 1;
 				SET_EMITTING_VOLUME(emittingVol);
 				RESET_LOOP_OFFSETS
 				m_sQueueSample.m_fSpeedMultiplier = 4.0f;
-				m_sQueueSample.m_SoundIntensity = CollisionSoundIntensity;
-				m_sQueueSample.m_bReleasingSoundFlag = TRUE;
-				m_sQueueSample.m_bReverbFlag = TRUE;
-				m_sQueueSample.m_bRequireReflection = FALSE;
+				m_sQueueSample.m_MaxDistance = COLLISION_MAX_DIST;
+				m_sQueueSample.m_bStatic = TRUE;
+				m_sQueueSample.m_bReverb = TRUE;
+				SET_SOUND_REFLECTION(FALSE);
 				AddSampleToRequestedQueue();
 			}
 		}
@@ -284,22 +282,22 @@ cAudioManager::SetUpLoopingCollisionSound(const cAudioCollision &col, uint8 coun
 		if(emittingVol) {
 			m_sQueueSample.m_fDistance = Sqrt(col.m_fDistance);
 			m_sQueueSample.m_nVolume =
-			    ComputeVolume(emittingVol, CollisionSoundIntensity, m_sQueueSample.m_fDistance);
-			if(m_sQueueSample.m_nVolume) {
+			    ComputeVolume(emittingVol, COLLISION_MAX_DIST, m_sQueueSample.m_fDistance);
+			if(m_sQueueSample.m_nVolume > 0) {
 				m_sQueueSample.m_nCounter = counter;
 				m_sQueueSample.m_vecPos = col.m_vecPosition;
 				m_sQueueSample.m_nBankIndex = SFX_BANK_0;
 				m_sQueueSample.m_bIs2D = FALSE;
-				m_sQueueSample.m_nReleasingVolumeModificator = 7;
+				m_sQueueSample.m_nPriority = 7;
 				m_sQueueSample.m_nLoopCount = 0;
 				SET_EMITTING_VOLUME(emittingVol);
 				SET_LOOP_OFFSETS(m_sQueueSample.m_nSampleIndex);
 				m_sQueueSample.m_fSpeedMultiplier = 4.0f;
-				m_sQueueSample.m_SoundIntensity = CollisionSoundIntensity;
-				m_sQueueSample.m_bReleasingSoundFlag = FALSE;
-				m_sQueueSample.m_nReleasingVolumeDivider = 5;
-				m_sQueueSample.m_bReverbFlag = TRUE;
-				m_sQueueSample.m_bRequireReflection = FALSE;
+				m_sQueueSample.m_MaxDistance = COLLISION_MAX_DIST;
+				m_sQueueSample.m_bStatic = FALSE;
+				m_sQueueSample.m_nFramesToPlay = 5;
+				m_sQueueSample.m_bReverb = TRUE;
+				SET_SOUND_REFLECTION(FALSE);
 				AddSampleToRequestedQueue();
 			}
 		}

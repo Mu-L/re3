@@ -7,49 +7,66 @@
 class tSound
 {
 public:
-	int32 m_nEntityIndex;
+	int32 m_nEntityIndex;		// audio entity index
 #if GTA_VERSION >= GTA3_PC_10
-	int32 m_nCounter;
+	uint32 m_nCounter;			// I'm not sure what this is but it looks like a virtual counter to determine the same sound in queue
+								// Values higher than 255 are used by reflections
 #else
 	uint8 m_nCounter;
 #endif
-	int32 m_nSampleIndex;
-	uint8 m_nBankIndex;
-	bool8 m_bIs2D;
-	int32 m_nReleasingVolumeModificator;
-	uint32 m_nFrequency;
-	uint8 m_nVolume;
-	float m_fDistance;
-	int32 m_nLoopCount;
+	uint32 m_nSampleIndex;		// An index of sample from AudioSamples.h
+	uint8 m_nBankIndex;			// A sound bank index. IDK what's the point of it here since samples are hardcoded anyway
+	bool8 m_bIs2D;				// If TRUE then sound is played in 2D space (such as frontend or police radio)
+	uint32 m_nPriority;			// The multiplier for the sound priority (see m_nFinalPriority below). Lesser value means higher priority
+	uint32 m_nFrequency;		// Sound frequency, plain and simple
+	uint8 m_nVolume;			// Sound volume (0..127), only used as an actual volume without EXTERNAL_3D_SOUND (see m_nEmittingVolume)
+	float m_fDistance;			// Distance to camera (useless if m_bIs2D == TRUE)
+	uint32 m_nLoopCount;		// 0 - always loop, 1 - don't loop, other values never seen
 #ifndef GTA_PS2
-	int32 m_nLoopStart;
+	// Loop offsets
+	uint32 m_nLoopStart;
 	int32 m_nLoopEnd;
 #endif
 #ifdef EXTERNAL_3D_SOUND
-	uint8 m_nEmittingVolume;
+	uint8 m_nEmittingVolume;	// The volume in 3D space, provided to 3D audio engine
 #endif
-	float m_fSpeedMultiplier;
+	float m_fSpeedMultiplier;	// Used for doppler effect. 0.0f - unaffected by doppler
 #if GTA_VERSION >= GTA3_PC_10
-	float m_SoundIntensity;
+	float m_MaxDistance;		// The maximum distance at which sound could be heard. Minimum distance = MaxDistance / 5 or MaxDistance / 4 in case of emitting volume (useless if m_bIs2D == TRUE)
 #else
-	uint32 m_SoundIntensity;
+	uint32 m_MaxDistance;
 #endif
-	bool8 m_bReleasingSoundFlag;
-	CVector m_vecPos;
-	bool8 m_bReverbFlag;
-#if GTA_VERSION >= GTA3_PC_10
-	uint8 m_nLoopsRemaining;
-	bool8 m_bRequireReflection; // Used for oneshots
+	bool8 m_bStatic;			// If TRUE then sound parameters cannot be changed during playback (frequency, position, etc.)
+	CVector m_vecPos;			// Position of sound in 3D space. Unused if m_bIs2D == TRUE
+	bool8 m_bReverb;			// Toggles reverb effect
+#ifdef AUDIO_REFLECTIONS
+	uint8 m_nReflectionDelay;	// Number of frames before reflection could be played. This is calculated internally by AudioManager and shouldn't be set by queued sample
+	bool8 m_bReflections;		// Add sound reflections
 #endif
-	uint8 m_nOffset;
-	int32 m_nReleasingVolumeDivider;
-	bool8 m_bIsProcessed;
-	bool8 m_bLoopEnded;
+	uint8 m_nPan;				// Sound panning (0-127). Controls the volume of the playback coming from left and right speaker. Calculated internally unless m_bIs2D==TRUE.
+								// 0 =   L 100%  R 0%
+								// 63 =  L 100%  R 100%
+								// 127 = L 0%    R 100%
+#ifndef FIX_BUGS
+	uint32 m_nFramesToPlay;		// Number of frames the sound would be played (if it stops being queued).
+								// This one is being set by queued sample for looping sounds, otherwise calculated inside AudioManager
+#else
+	float m_nFramesToPlay;		// Made into float for high fps fix
+#endif
+
+	// all fields below are internal to AudioManager calculations and aren't set by queued sample
+	bool8 m_bIsBeingPlayed;		// Set to TRUE when the sound was added or changed on current frame to avoid it being overwritten
+	bool8 m_bIsPlayingFinished;	// Not sure about the name. Set to TRUE when sampman channel becomes free
 #if GTA_VERSION < GTA3_PC_10
-	int32 unk; // only on PS2, seems unused
+	int32 unk;					// (inherited from GTA 2) Only on PS2, used by static non-looped sounds (AFAIK)
+								// Looks like it's keeping a number of frames left to play with the purpose of setting m_bIsPlayingFinished=TRUE once value reaches 0
+								// Default value is -3 for whatever reason
 #endif
-	int32 m_nCalculatedVolume;
-	int8 m_nVolumeChange;
+	uint32 m_nFinalPriority;	// Actual value used to compare priority, calculated using volume and m_nPriority. Lesser value means higher priority
+	int8 m_nVolumeChange;		// How much m_nVolume should reduce per each frame.
+#if defined(FIX_BUGS) && defined(EXTERNAL_3D_SOUND)
+	int8 m_nEmittingVolumeChange; // same as above but for m_nEmittingVolume
+#endif
 };
 
 VALIDATE_SIZE(tSound, 92);
@@ -74,12 +91,12 @@ VALIDATE_SIZE(tAudioEntity, 40);
 class tPedComment
 {
 public:
-	int32 m_nSampleIndex;
+	uint32 m_nSampleIndex;
 	int32 m_nEntityIndex;
 	CVector m_vecPos;
 	float m_fDistance;
 	uint8 m_nVolume;
-	int8 m_nProcess;
+	int8 m_nLoadingTimeout; // how many iterations we gonna wait until dropping the sample if it's still not loaded (only useful on PS2)
 #if defined(EXTERNAL_3D_SOUND) && defined(FIX_BUGS)
 	uint8 m_nEmittingVolume;
 #endif
@@ -90,44 +107,28 @@ VALIDATE_SIZE(tPedComment, 28);
 class cPedComments
 {
 public:
-	tPedComment m_asPedComments[NUM_PED_COMMENTS_BANKS][NUM_PED_COMMENTS_SLOTS];
-	uint8 m_nIndexMap[NUM_PED_COMMENTS_BANKS][NUM_PED_COMMENTS_SLOTS];
-	uint8 m_nCommentsInBank[NUM_PED_COMMENTS_BANKS];
-	uint8 m_nActiveBank;
+	tPedComment m_aPedCommentQueue[NUM_SOUND_QUEUES][NUM_PED_COMMENTS_SLOTS];
+	uint8 m_aPedCommentOrderList[NUM_SOUND_QUEUES][NUM_PED_COMMENTS_SLOTS];
+	uint8 m_nPedCommentCount[NUM_SOUND_QUEUES];
+	uint8 m_nActiveQueue;
 
 	cPedComments()
 	{
 		for (int i = 0; i < NUM_PED_COMMENTS_SLOTS; i++)
-			for (int j = 0; j < NUM_PED_COMMENTS_BANKS; j++) {
-				m_asPedComments[j][i].m_nProcess = -1;
-				m_nIndexMap[j][i] = NUM_PED_COMMENTS_SLOTS;
+			for (int j = 0; j < NUM_SOUND_QUEUES; j++) {
+				m_aPedCommentQueue[j][i].m_nLoadingTimeout = -1;
+				m_aPedCommentOrderList[j][i] = NUM_PED_COMMENTS_SLOTS;
 			}
 
-		for (int i = 0; i < NUM_PED_COMMENTS_BANKS; i++)
-			m_nCommentsInBank[i] = 0;
-		m_nActiveBank = 0;
+		for (int i = 0; i < NUM_SOUND_QUEUES; i++)
+			m_nPedCommentCount[i] = 0;
+		m_nActiveQueue = 0;
 	}
 	void Add(tPedComment *com);
 	void Process();
 };
 
 VALIDATE_SIZE(cPedComments, 1164);
-
-class CEntity;
-
-class cMissionAudio
-{
-public:
-	CVector m_vecPos;
-	bool8 m_bPredefinedProperties;
-	int32 m_nSampleIndex;
-	uint8 m_nLoadingStatus;
-	uint8 m_nPlayStatus;
-	bool8 m_bIsPlaying;
-	int32 m_nMissionAudioCounter;
-	bool8 m_bIsPlayed;
-};
-VALIDATE_SIZE(cMissionAudio, 32);
 
 // name made up
 class cAudioScriptObjectManager
@@ -142,6 +143,7 @@ public:
 
 
 class cTransmission;
+class CEntity;
 class CPlane;
 class CVehicle;
 class CPed;
@@ -168,7 +170,7 @@ public:
 	float m_fDistance;
 	CVehicle *m_pVehicle;
 	cTransmission *m_pTransmission;
-	int32 m_nIndex;
+	uint32 m_nIndex;
 	float m_fVelocityChange;
 
 	cVehicleParams()
@@ -202,30 +204,32 @@ enum {
 };
 
 enum PLAY_STATUS { PLAY_STATUS_STOPPED = 0, PLAY_STATUS_PLAYING, PLAY_STATUS_FINISHED };
-enum LOADING_STATUS { LOADING_STATUS_NOT_LOADED = 0, LOADING_STATUS_LOADED, LOADING_STATUS_FAILED };
+enum LOADING_STATUS { LOADING_STATUS_NOT_LOADED = 0, LOADING_STATUS_LOADED, LOADING_STATUS_LOADING };
 
 class cAudioManager
 {
 public:
 	bool8 m_bIsInitialised;
-	bool8 m_bReverb; // unused
-	bool8 m_bFifthFrameFlag;
+	bool8 m_bIsSurround; // unused until VC
+	bool8 m_bReduceReleasingPriority;
 	uint8 m_nActiveSamples;
-	uint8 m_bDoubleVolume; // unused
+	bool8 m_bDoubleVolume; // unused
+#if GTA_VERSION >= GTA3_PC_10
 	bool8 m_bDynamicAcousticModelingStatus;
+#endif
 	float m_fSpeedOfSound;
 	bool8 m_bTimerJustReset;
-	int32 m_nTimer;
+	uint32 m_nTimer;
 	tSound m_sQueueSample;
-	uint8 m_nActiveSampleQueue;
-	tSound m_asSamples[NUM_SOUNDS_SAMPLES_BANKS][NUM_CHANNELS_GENERIC];
-	uint8 m_abSampleQueueIndexTable[NUM_SOUNDS_SAMPLES_BANKS][NUM_CHANNELS_GENERIC];
-	uint8 m_SampleRequestQueuesStatus[NUM_SOUNDS_SAMPLES_BANKS];
+	uint8 m_nActiveQueue;
+	tSound m_aRequestedQueue[NUM_SOUND_QUEUES][NUM_CHANNELS_GENERIC];
+	uint8 m_aRequestedOrderList[NUM_SOUND_QUEUES][NUM_CHANNELS_GENERIC];
+	uint8 m_nRequestedCount[NUM_SOUND_QUEUES];
 	tSound m_asActiveSamples[NUM_CHANNELS_GENERIC];
 	tAudioEntity m_asAudioEntities[NUM_AUDIOENTITIES];
-	int32 m_anAudioEntityIndices[NUM_AUDIOENTITIES];
-	int32 m_nAudioEntitiesTotal;
-#if GTA_VERSION >= GTA3_PC_10
+	uint32 m_aAudioEntityOrderList[NUM_AUDIOENTITIES];
+	uint32 m_nAudioEntitiesCount;
+#ifdef AUDIO_REFLECTIONS
 	CVector m_avecReflectionsPos[MAX_REFLECTIONS];
 	float m_afReflectionsDistances[MAX_REFLECTIONS];
 #endif
@@ -235,16 +239,27 @@ public:
 	int32 m_nWaterCannonEntity;
 	int32 m_nPoliceChannelEntity;
 	cPoliceRadioQueue m_sPoliceRadioQueue;
+	cAMCrime m_aCrimes[10];
 	int32 m_nFrontEndEntity;
 	int32 m_nCollisionEntity;
 	cAudioCollisionManager m_sCollisionManager;
 	int32 m_nProjectileEntity;
 	int32 m_nBridgeEntity;
-	cMissionAudio m_sMissionAudio;
+	
+	// Mission audio stuff
+	CVector m_vecMissionAudioPosition;
+	bool8 m_bIsMissionAudio2D;
+	uint32 m_nMissionAudioSampleIndex;
+	uint8 m_nMissionAudioLoadingStatus;
+	uint8 m_nMissionAudioPlayStatus;
+	bool8 m_bIsMissionAudioPlaying;
+	int32 m_nMissionAudioFramesToPlay; // possibly unsigned
+	bool8 m_bIsMissionAudioAllowedToPlay;
+
 	int32 m_anRandomTable[5];
 	uint8 m_nTimeSpent;
-	uint8 m_nUserPause;
-	uint8 m_nPreviousUserPause;
+	bool8 m_bIsPaused;
+	bool8 m_bWasPaused;
 	uint32 m_FrameCounter;
 
 	cAudioManager();
@@ -276,7 +291,9 @@ public:
 	bool8 IsMP3RadioChannelAvailable();
 	void ReleaseDigitalHandle();
 	void ReacquireDigitalHandle();
+#ifdef AUDIO_REFLECTIONS
 	void SetDynamicAcousticModelingStatus(bool8 status);
+#endif
 	bool8 CheckForAnAudioFileOnCD();
 	char GetCDAudioDriveLetter();
 	bool8 IsAudioInitialised();
@@ -284,7 +301,7 @@ public:
 
 	void ServiceSoundEffects();
 	uint32 FL(float f); // not used
-	uint8 ComputeVolume(uint8 emittingVolume, float soundIntensity, float distance);
+	uint8 ComputeVolume(uint8 emittingVolume, float maxDistance, float distance);
 	void TranslateEntity(Const CVector *v1, CVector *v2);
 	int32 ComputePan(float, CVector *);
 	uint32 ComputeDopplerEffectedFrequency(uint32 oldFreq, float position1, float position2, float speedMultiplier); // inlined on PS2
@@ -292,7 +309,7 @@ public:
 	void InterrogateAudioEntities(); // inlined on PS2
 	void AddSampleToRequestedQueue();
 	void AddDetailsToRequestedOrderList(uint8 sample); // inlined on PS2
-#if GTA_VERSION >= GTA3_PC_10
+#ifdef AUDIO_REFLECTIONS
 	void AddReflectionsToRequestedQueue();
 	void UpdateReflections();
 #endif
@@ -301,11 +318,13 @@ public:
 	void ClearRequestedQueue(); // inlined on PS2
 	void ClearActiveSamples();
 	void GenerateIntegerRandomNumberTable(); // inlined on PS2
-	void LoadBankIfNecessary(uint8 bank); // this is used only on PS2 but technically not a platform code
+#ifdef GTA_PS2
+	bool8 LoadBankIfNecessary(uint8 bank); // this is used only on PS2 but technically not a platform code
+#endif
 
 #ifdef EXTERNAL_3D_SOUND // actually must have been && AUDIO_MSS as well
 	void AdjustSamplesVolume();
-	uint8 ComputeEmittingVolume(uint8 emittingVolume, float intensity, float dist);
+	uint8 ComputeEmittingVolume(uint8 emittingVolume, float maxDistance, float distance);
 #endif
 
 	// audio logic
@@ -318,7 +337,7 @@ public:
 	float GetDistanceSquared(const CVector &v);
 	void CalculateDistance(bool8 &condition, float dist);
 	void ProcessSpecial();
-	void ProcessEntity(int32 sound);
+	void ProcessEntity(int32 id);
 	void ProcessPhysical(int32 id);
 
 	// vehicles
@@ -338,7 +357,7 @@ public:
 	bool8 ProcessVehicleSkidding(cVehicleParams &params);
 	float GetVehicleDriveWheelSkidValue(uint8 wheel, CAutomobile *automobile, cTransmission *transmission, float velocityChange);
 	float GetVehicleNonDriveWheelSkidValue(uint8 wheel, CAutomobile *automobile, cTransmission *transmission, float velocityChange); // inlined on PS2
-	void ProcessVehicleHorn(cVehicleParams &params);
+	bool8 ProcessVehicleHorn(cVehicleParams &params);
 	bool8 UsesSiren(uint32 model); // inlined on PS2
 	bool8 UsesSirenSwitching(uint32 model); // inlined on PS2
 	bool8 ProcessVehicleSirenOrAlarm(cVehicleParams &params);
@@ -456,9 +475,9 @@ public:
 	uint32 GetGenericFemaleTalkSfx(uint16 sound);
 
 	// particles
-	void ProcessExplosions(int32 explosion);
-	void ProcessFires(int32 entity);
-	void ProcessWaterCannon(int32);
+	void ProcessExplosions(int32 id);
+	void ProcessFires(int32 id);
+	void ProcessWaterCannon(int32 id);
 
 	// script objects
 	void ProcessScriptObject(int32 id); // inlined on PS2
@@ -496,7 +515,7 @@ public:
 	void SetMissionAudioLocation(float x, float y, float z);
 	void PlayLoadedMissionAudio();
 	bool8 IsMissionAudioSampleFinished();
-	bool8 IsMissionAudioSamplePlaying() { return m_sMissionAudio.m_nPlayStatus == PLAY_STATUS_PLAYING; }
+	bool8 IsMissionAudioSamplePlaying() { return m_nMissionAudioPlayStatus == PLAY_STATUS_PLAYING; }
 	bool8 ShouldDuckMissionAudio() { return IsMissionAudioSamplePlaying(); }
 	void ClearMissionAudio();
 	void ProcessMissionAudio();
@@ -548,9 +567,21 @@ public:
 #else
 #define SET_EMITTING_VOLUME(vol)
 #endif
+#ifdef AUDIO_REFLECTIONS
+#define SET_SOUND_REFLECTION(b) m_sQueueSample.m_bReflections = b
+#else
+#define SET_SOUND_REFLECTION(b)
+#endif
 
 #if defined(AUDIO_MSS) && !defined(PS2_AUDIO_CHANNELS)
 static_assert(sizeof(cAudioManager) == 19220, "cAudioManager: error");
 #endif
 
 extern cAudioManager AudioManager;
+
+enum
+{
+	PED_COMMENT_VOLUME = 127,
+	PED_COMMENT_VOLUME_BEHIND_WALL = 31,
+	COLLISION_MAX_DIST = 60,
+};

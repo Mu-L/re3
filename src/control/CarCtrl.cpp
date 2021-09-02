@@ -773,14 +773,16 @@ CCarCtrl::PossiblyRemoveVehicle(CVehicle* pVehicle)
 		delete pVehicle;
 		return;
 	}
-	if (pVehicle->GetStatus() != STATUS_WRECKED || pVehicle->m_nTimeOfDeath == 0)
-		return;
-	if (CTimer::GetTimeInMilliseconds() > pVehicle->m_nTimeOfDeath + 60000 &&
-		!(pVehicle->GetIsOnScreen() && CRenderer::IsEntityCullZoneVisible(pVehicle)) ){
-		if ((pVehicle->GetPosition() - vecPlayerPos).MagnitudeSqr() > SQR(7.5f)){
-			if (!CGarages::IsPointWithinHideOutGarage(pVehicle->GetPosition())){
-				CWorld::Remove(pVehicle);
-				delete pVehicle;
+	if (pVehicle->GetStatus() == STATUS_WRECKED) {
+		if (pVehicle->m_nTimeOfDeath != 0) {
+			if (CTimer::GetTimeInMilliseconds() > pVehicle->m_nTimeOfDeath + 60000 &&
+				!(pVehicle->GetIsOnScreen() && CRenderer::IsEntityCullZoneVisible(pVehicle))) {
+				if ((pVehicle->GetPosition() - vecPlayerPos).MagnitudeSqr() > SQR(7.5f)) {
+					if (!CGarages::IsPointWithinHideOutGarage(pVehicle->GetPosition())) {
+						CWorld::Remove(pVehicle);
+						delete pVehicle;
+					}
+				}
 			}
 		}
 	}
@@ -808,8 +810,8 @@ CCarCtrl::UpdateCarOnRails(CVehicle* pVehicle)
 		pVehicle->AutoPilot.ModifySpeed(0.0f);
 		if (CTimer::GetTimeInMilliseconds() > pVehicle->AutoPilot.m_nTempAction){
 			pVehicle->AutoPilot.m_nTempAction = TEMPACT_NONE;
-			pVehicle->AutoPilot.m_nAntiReverseTimer = 0;
-			pVehicle->AutoPilot.m_nTimeToStartMission = 0;
+			pVehicle->AutoPilot.m_nAntiReverseTimer = CTimer::GetTimeInMilliseconds();
+			pVehicle->AutoPilot.m_nTimeToStartMission = CTimer::GetTimeInMilliseconds();
 		}
 		return;
 	}

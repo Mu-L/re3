@@ -10,35 +10,42 @@
 #include "sampman.h"
 #include "Camera.h"
 #include "World.h"
+#include "Entity.h"
 
 cAudioManager AudioManager;
 
 #define SPEED_OF_SOUND 343.f
+#ifdef GTA_PS2
+#define TIME_SPENT 40
+#else
 #define TIME_SPENT 50
+#endif
 
 cAudioManager::cAudioManager()
 {
 	m_bIsInitialised = FALSE;
-	m_bReverb = TRUE;
+	m_bIsSurround = TRUE;
 	m_fSpeedOfSound = SPEED_OF_SOUND / TIME_SPENT;
 	m_nTimeSpent = TIME_SPENT;
 	m_nActiveSamples = NUM_CHANNELS_GENERIC;
-	m_nActiveSampleQueue = 1;
+	m_nActiveQueue = 1;
 	ClearRequestedQueue();
-	m_nActiveSampleQueue = 0;
+	m_nActiveQueue = 0;
 	ClearRequestedQueue();
 	ClearActiveSamples();
 	GenerateIntegerRandomNumberTable();
 	m_bDoubleVolume = FALSE;
+#ifdef AUDIO_REFLECTIONS
 	m_bDynamicAcousticModelingStatus = TRUE;
+#endif
 
-	for (int i = 0; i < NUM_AUDIOENTITIES; i++) {
+	for (uint32 i = 0; i < NUM_AUDIOENTITIES; i++) {
 		m_asAudioEntities[i].m_bIsUsed = FALSE;
-		m_anAudioEntityIndices[i] = NUM_AUDIOENTITIES;
+		m_aAudioEntityOrderList[i] = NUM_AUDIOENTITIES;
 	}
-	m_nAudioEntitiesTotal = 0;
+	m_nAudioEntitiesCount = 0;
 	m_FrameCounter = 0;
-	m_bFifthFrameFlag = FALSE;
+	m_bReduceReleasingPriority = FALSE;
 	m_bTimerJustReset = FALSE;
 	m_nTimer = 0;
 }
@@ -61,7 +68,7 @@ cAudioManager::Initialise()
 			if (m_nActiveSamples <= 1) {
 				Terminate();
 			} else {
-				--m_nActiveSamples;
+				m_nActiveSamples--;
 #else
 			{
 				m_nActiveSamples = NUM_CHANNELS_GENERIC;
@@ -83,10 +90,10 @@ cAudioManager::Terminate()
 
 		for (uint32 i = 0; i < NUM_AUDIOENTITIES; i++) {
 			m_asAudioEntities[i].m_bIsUsed = FALSE;
-			m_anAudioEntityIndices[i] = ARRAY_SIZE(m_anAudioEntityIndices);
+			m_aAudioEntityOrderList[i] = NUM_AUDIOENTITIES;
 		}
 
-		m_nAudioEntitiesTotal = 0;
+		m_nAudioEntitiesCount = 0;
 		m_sAudioScriptObjectManager.m_nScriptObjectEntityTotal = 0;
 		PreTerminateGameSpecificShutdown();
 
@@ -112,9 +119,9 @@ cAudioManager::Service()
 		m_bTimerJustReset = FALSE;
 	}
 	if (m_bIsInitialised) {
-		m_nPreviousUserPause = m_nUserPause;
-		m_nUserPause = CTimer::GetIsUserPaused();
-#if GTA_VERSION >= GTA3_PC_10
+		m_bWasPaused = m_bIsPaused;
+		m_bIsPaused = CTimer::GetIsUserPaused();
+#ifdef AUDIO_REFLECTIONS
 		UpdateReflections();
 #endif
 		ServiceSoundEffects();
@@ -131,8 +138,47 @@ cAudioManager::CreateEntity(eAudioType type, void *entity)
 		return AEHANDLE_ERROR_NOENTITY;
 	if (type >= TOTAL_AUDIO_TYPES)
 		return AEHANDLE_ERROR_BADAUDIOTYPE;
-	for (uint32 i = 0; i < ARRAY_SIZE(m_asAudioEntities); i++) {
+
+#ifdef FIX_BUGS
+	// since sound could still play after entity deletion let's make sure we don't override one that is in use
+	// find all the free entity IDs that are being used by queued samples
+	int32 stillUsedEntities[NUM_CHANNELS_GENERIC * NUM_SOUND_QUEUES];
+	uint32 stillUsedEntitiesCount = 0;
+
+	for (uint8 i = 0; i < NUM_SOUND_QUEUES; i++)
+		for (uint8 j = 0; j < m_nRequestedCount[i]; j++) {
+			tSound &sound = m_aRequestedQueue[i][m_aRequestedOrderList[i][j]];
+			if (sound.m_nEntityIndex < 0) continue;
+			if (!m_asAudioEntities[sound.m_nEntityIndex].m_bIsUsed) {
+				bool found = false;
+				for (uint8 k = 0; k < stillUsedEntitiesCount; k++) {
+					if (stillUsedEntities[k] == sound.m_nEntityIndex) {
+						found = true;
+						break;
+					}
+				}
+				if (!found)
+					stillUsedEntities[stillUsedEntitiesCount++] = sound.m_nEntityIndex;
+			}
+		}
+#endif
+
+	for (uint32 i = 0; i < NUM_AUDIOENTITIES; i++) {
 		if (!m_asAudioEntities[i].m_bIsUsed) {
+#ifdef FIX_BUGS
+			// skip if ID is still used by queued sample
+			bool skip = false;
+			for (uint8 j = 0; j < stillUsedEntitiesCount; j++) {
+				if (stillUsedEntities[j] == i) {
+					//debug("audio entity %i still used, skipping\n", i);
+					skip = true;
+					break;
+				}
+			}
+			if (skip)
+				continue;
+#endif
+
 			m_asAudioEntities[i].m_bIsUsed = TRUE;
 			m_asAudioEntities[i].m_bStatus = FALSE;
 			m_asAudioEntities[i].m_nType = type;
@@ -142,7 +188,7 @@ cAudioManager::CreateEntity(eAudioType type, void *entity)
 			m_asAudioEntities[i].m_awAudioEvent[2] = SOUND_NO_SOUND;
 			m_asAudioEntities[i].m_awAudioEvent[3] = SOUND_NO_SOUND;
 			m_asAudioEntities[i].m_AudioEvents = 0;
-			m_anAudioEntityIndices[m_nAudioEntitiesTotal++] = i;
+			m_aAudioEntityOrderList[m_nAudioEntitiesCount++] = i;
 			return i;
 		}
 	}
@@ -154,11 +200,11 @@ cAudioManager::DestroyEntity(int32 id)
 {
 	if (m_bIsInitialised && id >= 0 && id < NUM_AUDIOENTITIES && m_asAudioEntities[id].m_bIsUsed) {
 		m_asAudioEntities[id].m_bIsUsed = FALSE;
-		for (int32 i = 0; i < m_nAudioEntitiesTotal; ++i) {
-			if (id == m_anAudioEntityIndices[i]) {
+		for (uint32 i = 0; i < m_nAudioEntitiesCount; i++) {
+			if (id == m_aAudioEntityOrderList[i]) {
 				if (i < NUM_AUDIOENTITIES - 1)
-					memmove(&m_anAudioEntityIndices[i], &m_anAudioEntityIndices[i + 1], NUM_AUDIOENTITY_EVENTS * (m_nAudioEntitiesTotal - (i + 1)));
-				m_anAudioEntityIndices[--m_nAudioEntitiesTotal] = NUM_AUDIOENTITIES;
+					memmove(&m_aAudioEntityOrderList[i], &m_aAudioEntityOrderList[i + 1], sizeof(uint32) * (m_nAudioEntitiesCount - (i + 1)));
+				m_aAudioEntityOrderList[--m_nAudioEntitiesCount] = NUM_AUDIOENTITIES;
 				return;
 			}
 		}
@@ -188,15 +234,17 @@ cAudioManager::GetEntityPointer(int32 id)
 	return NULL;
 }
 
+static Const uint8 OneShotPriority[] = {
+										3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 5, 5, 5, 3, 5, 2, 2, 1, 1, 3, 1, 3, 3, 1, 1, 1, 4, 4, 3, 1, 1,
+										1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6, 1, 1, 3, 2, 2, 2, 2, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+										1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 3, 1, 1, 1, 9,
+										2, 2, 0, 0, 0, 0, 3, 3, 5, 1, 1, 1, 1, 3, 4, 7, 6, 6, 6, 6, 1, 3, 4, 3, 4, 2, 1, 3, 5, 4, 6, 6, 1, 3,
+										1, 1, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+										};
+
 void
 cAudioManager::PlayOneShot(int32 index, uint16 sound, float vol)
 {
-	static const uint8 OneShotPriority[] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 5, 5, 5, 3, 5, 2, 2, 1, 1, 3, 1, 3, 3, 1, 1, 1, 4, 4, 3, 1, 1,
-	                                        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 6, 1, 1, 3, 2, 2, 2, 2, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	                                        1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 3, 1, 1, 1, 9,
-	                                        2, 2, 0, 0, 0, 0, 3, 3, 5, 1, 1, 1, 1, 3, 4, 7, 6, 6, 6, 6, 1, 3, 4, 3, 4, 2, 1, 3, 5, 4, 6, 6, 1, 3,
-	                                        1, 1, 1, 0, 0, 0, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-
 	if (m_bIsInitialised) {
 		if (index >= 0 && index < NUM_AUDIOENTITIES) {
 			tAudioEntity &entity = m_asAudioEntities[index];
@@ -212,25 +260,25 @@ cAudioManager::PlayOneShot(int32 index, uint16 sound, float vol)
 						int32 i = 0;
 						while (TRUE) {
 							if (i >= entity.m_AudioEvents) {
-								if (entity.m_AudioEvents < ARRAY_SIZE(entity.m_awAudioEvent)) {
+								if (entity.m_AudioEvents < NUM_AUDIOENTITY_EVENTS) {
 									entity.m_awAudioEvent[i] = sound;
 									entity.m_afVolume[i] = vol;
-									++entity.m_AudioEvents;
+									entity.m_AudioEvents++;
 								}
 								return;
 							}
 							if (OneShotPriority[entity.m_awAudioEvent[i]] > OneShotPriority[sound])
 								break;
-							++i;
+							i++;
 						}
 						if (i < NUM_AUDIOENTITY_EVENTS - 1) {
-							memmove(&entity.m_awAudioEvent[i + 1], &entity.m_awAudioEvent[i], (NUM_AUDIOENTITY_EVENTS - 1 - i) * NUM_AUDIOENTITY_EVENTS / 2);
-							memmove(&entity.m_afVolume[i + 1], &entity.m_afVolume[i], (NUM_AUDIOENTITY_EVENTS - 1 - i) * NUM_AUDIOENTITY_EVENTS);
+							memmove(&entity.m_awAudioEvent[i + 1], &entity.m_awAudioEvent[i], (NUM_AUDIOENTITY_EVENTS - 1 - i) * sizeof(int16));
+							memmove(&entity.m_afVolume[i + 1], &entity.m_afVolume[i], (NUM_AUDIOENTITY_EVENTS - 1 - i) * sizeof(float));
 						}
 						entity.m_awAudioEvent[i] = sound;
 						entity.m_afVolume[i] = vol;
-						if (entity.m_AudioEvents < ARRAY_SIZE(entity.m_awAudioEvent))
-							++entity.m_AudioEvents;
+						if (entity.m_AudioEvents < NUM_AUDIOENTITY_EVENTS)
+							entity.m_AudioEvents++;
 					}
 				}
 			}
@@ -275,14 +323,14 @@ cAudioManager::ResetTimers(uint32 time)
 		m_bTimerJustReset = TRUE;
 		m_nTimer = time;
 		ClearRequestedQueue();
-		if (m_nActiveSampleQueue) {
-			m_nActiveSampleQueue = 0;
+		if (m_nActiveQueue) {
+			m_nActiveQueue = 0;
 			ClearRequestedQueue();
-			m_nActiveSampleQueue = 1;
+			m_nActiveQueue = 1;
 		} else {
-			m_nActiveSampleQueue = 1;
+			m_nActiveQueue = 1;
 			ClearRequestedQueue();
-			m_nActiveSampleQueue = 0;
+			m_nActiveQueue = 0;
 		}
 		ClearActiveSamples();
 		ClearMissionAudio();
@@ -302,7 +350,7 @@ cAudioManager::DestroyAllGameCreatedEntities()
 	cAudioScriptObject *entity;
 
 	if (m_bIsInitialised) {
-		for (uint32 i = 0; i < ARRAY_SIZE(m_asAudioEntities); i++) {
+		for (uint32 i = 0; i < NUM_AUDIOENTITIES; i++) {
 			if (m_asAudioEntities[i].m_bIsUsed) {
 				switch (m_asAudioEntities[i].m_nType) {
 				case AUDIOTYPE_PHYSICAL:
@@ -380,13 +428,13 @@ cAudioManager::SetCurrent3DProvider(uint8 which)
 #else
 	if (!m_bIsInitialised)
 		return -1;
-	for (uint8 i = 0; i < m_nActiveSamples + 1; ++i)
+	for (uint8 i = 0; i < m_nActiveSamples + 1; i++)
 		SampleManager.StopChannel(i);
 	ClearRequestedQueue();
-	if (m_nActiveSampleQueue == 0)
-		m_nActiveSampleQueue = 1;
+	if (m_nActiveQueue == 0)
+		m_nActiveQueue = 1;
 	else
-		m_nActiveSampleQueue = 0;
+		m_nActiveQueue = 0;
 	ClearRequestedQueue();
 	ClearActiveSamples();
 	int8 current = SampleManager.SetCurrent3DProvider(which);
@@ -394,7 +442,7 @@ cAudioManager::SetCurrent3DProvider(uint8 which)
 #ifdef EXTERNAL_3D_SOUND
 		m_nActiveSamples = SampleManager.GetMaximumSupportedChannels();
 		if (m_nActiveSamples > 1)
-			--m_nActiveSamples;
+			m_nActiveSamples--;
 #endif
 	}
 	return current;
@@ -421,24 +469,24 @@ cAudioManager::IsMP3RadioChannelAvailable()
 void
 cAudioManager::ReleaseDigitalHandle()
 {
-	if (m_bIsInitialised) {
+	if (m_bIsInitialised)
 		SampleManager.ReleaseDigitalHandle();
-	}
 }
 
 void
 cAudioManager::ReacquireDigitalHandle()
 {
-	if (m_bIsInitialised) {
+	if (m_bIsInitialised)
 		SampleManager.ReacquireDigitalHandle();
-	}
 }
 
+#ifdef AUDIO_REFLECTIONS
 void
 cAudioManager::SetDynamicAcousticModelingStatus(bool8 status)
 {
 	m_bDynamicAcousticModelingStatus = status;
 }
+#endif
 
 bool8
 cAudioManager::CheckForAnAudioFileOnCD()
@@ -469,24 +517,24 @@ cAudioManager::ServiceSoundEffects()
 #ifdef FIX_BUGS
 	if(CTimer::GetLogicalFramesPassed() != 0)
 #endif
-	m_bFifthFrameFlag = (m_FrameCounter++ % 5) == 0;
-	if (m_nUserPause && !m_nPreviousUserPause) {
+	m_bReduceReleasingPriority = (m_FrameCounter++ % 5) == 0;
+	if (m_bIsPaused && !m_bWasPaused) {
 		for (int32 i = 0; i < NUM_CHANNELS; i++)
 			SampleManager.StopChannel(i);
 
 		ClearRequestedQueue();
-		if (m_nActiveSampleQueue) {
-			m_nActiveSampleQueue = 0;
+		if (m_nActiveQueue) {
+			m_nActiveQueue = 0;
 			ClearRequestedQueue();
-			m_nActiveSampleQueue = 1;
+			m_nActiveQueue = 1;
 		} else {
-			m_nActiveSampleQueue = 1;
+			m_nActiveQueue = 1;
 			ClearRequestedQueue();
-			m_nActiveSampleQueue = 0;
+			m_nActiveQueue = 0;
 		}
 		ClearActiveSamples();
 	}
-	m_nActiveSampleQueue = m_nActiveSampleQueue == 1 ? 0 : 1;
+	m_nActiveQueue = m_nActiveQueue == 1 ? 0 : 1;
 	ProcessReverb();
 	ProcessSpecial();
 	ClearRequestedQueue();
@@ -503,7 +551,7 @@ cAudioManager::ServiceSoundEffects()
 #ifdef AUDIO_OAL
 	SampleManager.Service();
 #endif
-	for (int32 i = 0; i < m_sAudioScriptObjectManager.m_nScriptObjectEntityTotal; ++i) {
+	for (int32 i = 0; i < m_sAudioScriptObjectManager.m_nScriptObjectEntityTotal; i++) {
 		cAudioScriptObject *object = (cAudioScriptObject *)m_asAudioEntities[m_sAudioScriptObjectManager.m_anScriptObjectEntityIndices[i]].m_pEntity;
 		delete object;
 		m_asAudioEntities[m_sAudioScriptObjectManager.m_anScriptObjectEntityIndices[i]].m_pEntity = nil;
@@ -519,14 +567,14 @@ cAudioManager::FL(float f)
 }
 
 uint8
-cAudioManager::ComputeVolume(uint8 emittingVolume, float soundIntensity, float distance)
+cAudioManager::ComputeVolume(uint8 emittingVolume, float maxDistance, float distance)
 {
-	float newSoundIntensity;
-	if (soundIntensity <= 0.0f)
+	float minDistance;
+	if (maxDistance <= 0.0f)
 		return 0;
-	newSoundIntensity = soundIntensity / 5.0f;
-	if (newSoundIntensity <= distance)
-		emittingVolume = sq((soundIntensity - newSoundIntensity - (distance - newSoundIntensity)) / (soundIntensity - newSoundIntensity)) * emittingVolume;
+	minDistance = maxDistance / 5.0f;
+	if (minDistance <= distance)
+		emittingVolume = sq((maxDistance - minDistance - (distance - minDistance)) / (maxDistance - minDistance)) * emittingVolume;
 	return emittingVolume;
 }
 
@@ -542,7 +590,7 @@ cAudioManager::ComputePan(float dist, CVector *vec)
 	Const static uint8 PanTable[64] = {0,  3,  8,  12, 16, 19, 22, 24, 26, 28, 30, 31, 33, 34, 36, 37, 39, 40, 41, 42, 44, 45, 46, 47, 48, 49, 49, 50, 51, 52, 53, 53,
 									   54, 55, 55, 56, 56, 57, 57, 58, 58, 58, 59, 59, 59, 60, 60, 61, 61, 61, 61, 62, 62, 62, 62, 62, 63, 63, 63, 63, 63, 63, 63, 63};
 
-	int32 index = vec->x / (dist / 64.f);
+	int32 index = vec->x / (dist / 64.0f);
 	index = Min(63, ABS(index));
 
 	if (vec->x > 0.f)
@@ -575,15 +623,15 @@ cAudioManager::RandomDisplacement(uint32 seed)
 	static bool8 bPos = TRUE;
 	static uint32 Adjustment = 0;
 
-	if (!seed)
+	if (seed == 0)
 		return 0;
 
 	value = m_anRandomTable[(Adjustment + seed) % 5] % seed;
 	Adjustment += value;
 
-	if (value % 2) {
+	if (value % 2) 
 		bPos = !bPos;
-	}
+
 	if (!bPos)
 		value = -value;
 	return value;
@@ -592,51 +640,64 @@ cAudioManager::RandomDisplacement(uint32 seed)
 void
 cAudioManager::InterrogateAudioEntities()
 {
-	for (int32 i = 0; i < m_nAudioEntitiesTotal; i++) {
-		ProcessEntity(m_anAudioEntityIndices[i]);
-		m_asAudioEntities[m_anAudioEntityIndices[i]].m_AudioEvents = 0;
+	for (uint32 i = 0; i < m_nAudioEntitiesCount; i++) {
+		ProcessEntity(m_aAudioEntityOrderList[i]);
+		m_asAudioEntities[m_aAudioEntityOrderList[i]].m_AudioEvents = 0;
 	}
 }
 
 void
 cAudioManager::AddSampleToRequestedQueue()
 {
-	int32 calculatedVolume;
+	uint32 finalPriority;
 	uint8 sampleIndex;
+#ifdef AUDIO_REFLECTIONS
 	bool8 bReflections;
+#endif
 
 	if (m_sQueueSample.m_nSampleIndex < TOTAL_AUDIO_SAMPLES) {
-		calculatedVolume = m_sQueueSample.m_nReleasingVolumeModificator * (MAX_VOLUME - m_sQueueSample.m_nVolume);
-		sampleIndex = m_SampleRequestQueuesStatus[m_nActiveSampleQueue];
+		finalPriority = m_sQueueSample.m_nPriority * (MAX_VOLUME - m_sQueueSample.m_nVolume);
+		sampleIndex = m_nRequestedCount[m_nActiveQueue];
 		if (sampleIndex >= m_nActiveSamples) {
-			sampleIndex = m_abSampleQueueIndexTable[m_nActiveSampleQueue][m_nActiveSamples - 1];
-			if (m_asSamples[m_nActiveSampleQueue][sampleIndex].m_nCalculatedVolume <= calculatedVolume)
+			sampleIndex = m_aRequestedOrderList[m_nActiveQueue][m_nActiveSamples - 1];
+			if (m_aRequestedQueue[m_nActiveQueue][sampleIndex].m_nFinalPriority <= finalPriority)
 				return;
-		} else {
-			++m_SampleRequestQueuesStatus[m_nActiveSampleQueue];
+		} else
+			m_nRequestedCount[m_nActiveQueue]++;
+#if GTA_VERSION < GTA3_PC_10
+		if (m_sQueueSample.m_bStatic) {
+			if (m_sQueueSample.m_nLoopCount > 0)
+				m_sQueueSample.unk = m_nTimeSpent * SampleManager.GetSampleLength(m_sQueueSample.m_nSampleIndex) / m_sQueueSample.m_nFrequency;
+			else
+				m_sQueueSample.unk = -3;
 		}
-		m_sQueueSample.m_nCalculatedVolume = calculatedVolume;
-		m_sQueueSample.m_bLoopEnded = FALSE;
+#endif
+		m_sQueueSample.m_nFinalPriority = finalPriority;
+		m_sQueueSample.m_bIsPlayingFinished = FALSE;
+#ifdef AUDIO_REFLECTIONS
 		if (m_sQueueSample.m_bIs2D) {
-			m_sQueueSample.m_bRequireReflection = FALSE;
-			m_sQueueSample.m_nLoopsRemaining = 0;
+			m_sQueueSample.m_bReflections = FALSE;
+			m_sQueueSample.m_nReflectionDelay = 0;
 		}
-		if (m_bDynamicAcousticModelingStatus && m_sQueueSample.m_nLoopCount) {
-			bReflections = m_sQueueSample.m_bRequireReflection;
+		if (m_bDynamicAcousticModelingStatus && m_sQueueSample.m_nLoopCount > 0) {
+			bReflections = m_sQueueSample.m_bReflections;
 		} else {
 			bReflections = FALSE;
-			m_sQueueSample.m_nLoopsRemaining = 0;
+			m_sQueueSample.m_nReflectionDelay = 0;
 		}
-		m_sQueueSample.m_bRequireReflection = FALSE;
+		m_sQueueSample.m_bReflections = FALSE;
 
 		if (!m_bDynamicAcousticModelingStatus)
-			m_sQueueSample.m_bReverbFlag = FALSE;
+			m_sQueueSample.m_bReverb = FALSE;
+#endif
 
-		m_asSamples[m_nActiveSampleQueue][sampleIndex] = m_sQueueSample;
+		m_aRequestedQueue[m_nActiveQueue][sampleIndex] = m_sQueueSample;
 
 		AddDetailsToRequestedOrderList(sampleIndex);
+#ifdef AUDIO_REFLECTIONS
 		if (bReflections)
 			AddReflectionsToRequestedQueue();
+#endif
 	}
 }
 
@@ -646,43 +707,43 @@ cAudioManager::AddDetailsToRequestedOrderList(uint8 sample)
 	uint32 i = 0;
 	if (sample != 0) {
 		for (; i < sample; i++) {
-			if (m_asSamples[m_nActiveSampleQueue][m_abSampleQueueIndexTable[m_nActiveSampleQueue][i]].m_nCalculatedVolume >
-			    m_asSamples[m_nActiveSampleQueue][sample].m_nCalculatedVolume)
+			if (m_aRequestedQueue[m_nActiveQueue][m_aRequestedOrderList[m_nActiveQueue][i]].m_nFinalPriority >
+			    m_aRequestedQueue[m_nActiveQueue][sample].m_nFinalPriority)
 				break;
 		}
-		if (i < sample) {
-			memmove(&m_abSampleQueueIndexTable[m_nActiveSampleQueue][i + 1], &m_abSampleQueueIndexTable[m_nActiveSampleQueue][i], m_nActiveSamples - i - 1);
-		}
+		if (i < sample)
+			memmove(&m_aRequestedOrderList[m_nActiveQueue][i + 1], &m_aRequestedOrderList[m_nActiveQueue][i], m_nActiveSamples - i - 1);
 	}
-	m_abSampleQueueIndexTable[m_nActiveSampleQueue][i] = sample;
+	m_aRequestedOrderList[m_nActiveQueue][i] = sample;
 }
 
-#if GTA_VERSION >= GTA3_PC_10
+#ifdef AUDIO_REFLECTIONS
 void
 cAudioManager::AddReflectionsToRequestedQueue()
 {
 	float reflectionDistance;
 	int32 noise;
-	uint8 emittingVolume = (m_sQueueSample.m_nVolume / 2) + (m_sQueueSample.m_nVolume / 8);
+	uint32 oldCounter = m_sQueueSample.m_nCounter;
+	uint8 emittingVolume = (m_sQueueSample.m_nVolume >> 1) + (m_sQueueSample.m_nVolume >> 3);
 
 	for (uint32 i = 0; i < ARRAY_SIZE(m_afReflectionsDistances); i++) {
 		reflectionDistance = m_afReflectionsDistances[i];
-		if (reflectionDistance > 0.0f && reflectionDistance < 100.f && reflectionDistance < m_sQueueSample.m_SoundIntensity) {
-			m_sQueueSample.m_nLoopsRemaining = (reflectionDistance * 500.f / 1029.f);
-			if (m_sQueueSample.m_nLoopsRemaining > 5) {
+		if (reflectionDistance > 0.0f && reflectionDistance < 100.0f && reflectionDistance < m_sQueueSample.m_MaxDistance) {
+			m_sQueueSample.m_nReflectionDelay = (reflectionDistance * 500.0f / 1029.0f);
+			if (m_sQueueSample.m_nReflectionDelay > 5) {
 				m_sQueueSample.m_fDistance = m_afReflectionsDistances[i];
 				SET_EMITTING_VOLUME(emittingVolume);
-				m_sQueueSample.m_nVolume = ComputeVolume(emittingVolume, m_sQueueSample.m_SoundIntensity, m_sQueueSample.m_fDistance);
-				if (m_sQueueSample.m_nVolume > emittingVolume / 16) {
-					m_sQueueSample.m_nCounter += (i + 1) * 256;
-					if (m_sQueueSample.m_nLoopCount) {
-						noise = RandomDisplacement(m_sQueueSample.m_nFrequency / 32);
-						if (noise <= 0)
-							m_sQueueSample.m_nFrequency += noise;
-						else
+				m_sQueueSample.m_nVolume = ComputeVolume(emittingVolume, m_sQueueSample.m_MaxDistance, m_sQueueSample.m_fDistance);
+				if (m_sQueueSample.m_nVolume > emittingVolume >> 4) {
+					m_sQueueSample.m_nCounter = oldCounter + ((i + 1) << 8);
+					if (m_sQueueSample.m_nLoopCount > 0) {
+						noise = RandomDisplacement(m_sQueueSample.m_nFrequency >> 5);
+						if (noise > 0)
 							m_sQueueSample.m_nFrequency -= noise;
+						else
+							m_sQueueSample.m_nFrequency += noise;
 					}
-					m_sQueueSample.m_nReleasingVolumeModificator += 20;
+					m_sQueueSample.m_nPriority += 20;
 					m_sQueueSample.m_vecPos = m_avecReflectionsPos[i];
 					AddSampleToRequestedQueue();
 				}
@@ -740,7 +801,7 @@ cAudioManager::UpdateReflections()
 			m_afReflectionsDistances[4] = 50.0f;
 	}
 }
-#endif // GTA_VERSION >= GTA3_PC_10
+#endif // AUDIO_REFLECTIONS
 
 void
 cAudioManager::AddReleasingSounds()
@@ -752,46 +813,115 @@ cAudioManager::AddReleasingSounds()
 	bool8 toProcess[44];
 #endif
 
-	int8 queue = m_nActiveSampleQueue == 0 ? 1 : 0;
+	uint8 queue = m_nActiveQueue == 0 ? 1 : 0;
 
-	for (int32 i = 0; i < m_SampleRequestQueuesStatus[queue]; i++) {
-		tSound &sample = m_asSamples[queue][m_abSampleQueueIndexTable[queue][i]];
-		if (sample.m_bLoopEnded)
+	for (uint8 i = 0; i < m_nRequestedCount[queue]; i++) {
+		tSound &sample = m_aRequestedQueue[queue][m_aRequestedOrderList[queue][i]];
+		if (sample.m_bIsPlayingFinished)
 			continue;
 
 		toProcess[i] = FALSE;
-		for (int32 j = 0; j < m_SampleRequestQueuesStatus[m_nActiveSampleQueue]; j++) {
-			if (sample.m_nEntityIndex == m_asSamples[m_nActiveSampleQueue][m_abSampleQueueIndexTable[m_nActiveSampleQueue][j]].m_nEntityIndex &&
-			    sample.m_nCounter == m_asSamples[m_nActiveSampleQueue][m_abSampleQueueIndexTable[m_nActiveSampleQueue][j]].m_nCounter) {
+		for (uint8 j = 0; j < m_nRequestedCount[m_nActiveQueue]; j++) {
+			if (sample.m_nEntityIndex == m_aRequestedQueue[m_nActiveQueue][m_aRequestedOrderList[m_nActiveQueue][j]].m_nEntityIndex &&
+			    sample.m_nCounter == m_aRequestedQueue[m_nActiveQueue][m_aRequestedOrderList[m_nActiveQueue][j]].m_nCounter) {
 				toProcess[i] = TRUE;
 				break;
 			}
 		}
 		if (!toProcess[i]) {
-			if (sample.m_nCounter <= 255 || sample.m_nLoopsRemaining == 0) {
-				if (sample.m_nReleasingVolumeDivider == 0)
+#ifdef AUDIO_REFLECTIONS
+			if (sample.m_nCounter <= 255 || sample.m_nReflectionDelay == 0) // check if not delayed reflection
+#endif
+			{
+#ifdef ATTACH_RELEASING_SOUNDS_TO_ENTITIES
+				if (sample.m_nCounter <= 255 && !sample.m_bIs2D) { // check if not reflection and is a 3D sound
+					CEntity* entity = (CEntity*)GetEntityPointer(sample.m_nEntityIndex);
+					if (entity && m_asAudioEntities[sample.m_nEntityIndex].m_nType == AUDIOTYPE_PHYSICAL) {
+						sample.m_vecPos = entity->GetPosition();
+						float oldDistance = sample.m_fDistance;
+						sample.m_fDistance = Sqrt(GetDistanceSquared(sample.m_vecPos));
+						if (sample.m_nSampleIndex >= SAMPLEBANK_PED_START && sample.m_nSampleIndex <= SAMPLEBANK_PED_END) { // check if it's ped comment
+							uint8 vol;
+							if (CWorld::GetIsLineOfSightClear(TheCamera.GetPosition(), sample.m_vecPos, true, false, false, false, false, false))
+								vol = PED_COMMENT_VOLUME;
+							else
+								vol = PED_COMMENT_VOLUME_BEHIND_WALL;
+#ifdef EXTERNAL_3D_SOUND
+							sample.m_nEmittingVolume = vol;
+#endif
+							sample.m_nVolume = ComputeVolume(vol, sample.m_MaxDistance, sample.m_fDistance);
+						} else {
+							// calculate new volume with changed distance
+							float volumeDiff = sq((sample.m_MaxDistance - sample.m_fDistance) / (sample.m_MaxDistance - oldDistance));
+							if (volumeDiff > 0.0f) {
+								uint8 newVolume = volumeDiff * sample.m_nVolume;
+								if (sample.m_nVolumeChange > 0)
+									sample.m_nVolumeChange = volumeDiff * sample.m_nVolumeChange;
+#if defined(FIX_BUGS) && defined(EXTERNAL_3D_SOUND)
+								if (sample.m_nEmittingVolumeChange > 0)
+									sample.m_nEmittingVolumeChange = volumeDiff * sample.m_nEmittingVolumeChange;
+#endif
+								sample.m_nVolume = Min(MAX_VOLUME, newVolume);
+							}
+						}
+						if (sample.m_nVolume == 0)
+							sample.m_nFramesToPlay = 0;
+					}
+				}
+#endif
+#ifdef FIX_BUGS
+				// fixing emitting volume not being lowered and high fps bugs
+				if (sample.m_nFramesToPlay <= 0)
 					continue;
 				if (sample.m_nLoopCount == 0) {
 					if (sample.m_nVolumeChange == -1) {
-						sample.m_nVolumeChange = sample.m_nVolume / sample.m_nReleasingVolumeDivider;
+						sample.m_nVolumeChange = sample.m_nVolume / sample.m_nFramesToPlay;
+						if (sample.m_nVolumeChange <= 0)
+							sample.m_nVolumeChange = 1;
+#ifdef EXTERNAL_3D_SOUND
+						sample.m_nEmittingVolumeChange = sample.m_nEmittingVolume / sample.m_nFramesToPlay;
+						if (sample.m_nEmittingVolumeChange <= 0)
+							sample.m_nEmittingVolumeChange = 1;
+#endif
+					}
+					if (sample.m_nVolume <= sample.m_nVolumeChange * CTimer::GetTimeStepFix()) {
+						sample.m_nFramesToPlay = 0;
+						continue;
+					}
+					sample.m_nVolume -= sample.m_nVolumeChange * CTimer::GetTimeStepFix();
+#ifdef EXTERNAL_3D_SOUND
+					if (sample.m_nEmittingVolume <= sample.m_nEmittingVolumeChange * CTimer::GetTimeStepFix()) {
+						sample.m_nFramesToPlay = 0;
+						continue;
+					}
+					sample.m_nEmittingVolume -= sample.m_nEmittingVolumeChange * CTimer::GetTimeStepFix();
+#endif
+				}
+				sample.m_nFramesToPlay -= CTimer::GetTimeStepFix();
+				if (sample.m_nFramesToPlay < 0)
+					sample.m_nFramesToPlay = 0;
+#else
+				if (sample.m_nFramesToPlay == 0)
+					continue;
+				if (sample.m_nLoopCount == 0) {
+					if (sample.m_nVolumeChange == -1) {
+						sample.m_nVolumeChange = sample.m_nVolume / sample.m_nFramesToPlay;
 						if (sample.m_nVolumeChange <= 0)
 							sample.m_nVolumeChange = 1;
 					}
 					if (sample.m_nVolume <= sample.m_nVolumeChange) {
-						sample.m_nReleasingVolumeDivider = 0;
+						sample.m_nFramesToPlay = 0;
 						continue;
 					}
 					sample.m_nVolume -= sample.m_nVolumeChange;
 				}
-#ifdef FIX_BUGS
-				if(CTimer::GetLogicalFramesPassed() != 0)
+				sample.m_nFramesToPlay--;
 #endif
-				--sample.m_nReleasingVolumeDivider;
-				if (m_bFifthFrameFlag) {
-					if (sample.m_nReleasingVolumeModificator < 20)
-						++sample.m_nReleasingVolumeModificator;
+				if (m_bReduceReleasingPriority) {
+					if (sample.m_nPriority < 20)
+						sample.m_nPriority++;
 				}
-				sample.m_bReleasingSoundFlag = 0;
+				sample.m_bStatic = FALSE;
 			}
 			memcpy(&m_sQueueSample, &sample, sizeof(tSound));
 			AddSampleToRequestedQueue();
@@ -820,46 +950,63 @@ cAudioManager::ProcessActiveQueues()
 	uint8 emittingVol;
 	CVector position;
 
-	for (int32 i = 0; i < m_nActiveSamples; i++) {
-		m_asSamples[m_nActiveSampleQueue][i].m_bIsProcessed = FALSE;
-		m_asActiveSamples[i].m_bIsProcessed = FALSE;
+#ifdef EXTERNAL_3D_SOUND
+	#define WORKING_VOLUME_FIELD m_nEmittingVolume
+#else
+	#define WORKING_VOLUME_FIELD m_nVolume
+#endif
+
+#ifdef USE_TIME_SCALE_FOR_AUDIO
+	float timeScale = m_bIsPaused ? 1.0f : CTimer::GetTimeScale();
+#endif
+
+	for (uint8 i = 0; i < m_nActiveSamples; i++) {
+		m_aRequestedQueue[m_nActiveQueue][i].m_bIsBeingPlayed = FALSE;
+		m_asActiveSamples[i].m_bIsBeingPlayed = FALSE;
 	}
 
-	for (int32 i = 0; i < m_SampleRequestQueuesStatus[m_nActiveSampleQueue]; i++) {
-		tSound &sample = m_asSamples[m_nActiveSampleQueue][m_abSampleQueueIndexTable[m_nActiveSampleQueue][i]];
+	for (uint8 i = 0; i < m_nRequestedCount[m_nActiveQueue]; i++) {
+		tSound &sample = m_aRequestedQueue[m_nActiveQueue][m_aRequestedOrderList[m_nActiveQueue][i]];
 		if (sample.m_nSampleIndex != NO_SAMPLE) {
-			for (int32 j = 0; j < m_nActiveSamples; j++) {
+			for (uint8 j = 0; j < m_nActiveSamples; j++) {
 				if (sample.m_nEntityIndex == m_asActiveSamples[j].m_nEntityIndex && sample.m_nCounter == m_asActiveSamples[j].m_nCounter &&
 				    sample.m_nSampleIndex == m_asActiveSamples[j].m_nSampleIndex) {
-					if (sample.m_nLoopCount) {
+					if (sample.m_nLoopCount > 0) {
+#if GTA_VERSION >= GTA3_PC_10
 						if (m_FrameCounter & 1)
 							flag = !!(j & 1);
 						else
 							flag = !(j & 1);
-
 						if (flag && !SampleManager.GetChannelUsedFlag(j)) {
-							sample.m_bLoopEnded = TRUE;
-							m_asActiveSamples[j].m_bLoopEnded = TRUE;
+#else
+						if (m_asActiveSamples[j].unk != 0)
+							m_asActiveSamples[j].unk--;
+						else if (SampleManager.GetChannelUsedFlag(j))
+							m_asActiveSamples[j].unk = m_nTimeSpent * SampleManager.GetSampleLength(m_asActiveSamples[j].m_nSampleIndex) / m_asActiveSamples[j].m_nFrequency;
+						else {
+#endif
+							sample.m_bIsPlayingFinished = TRUE;
+							m_asActiveSamples[j].m_bIsPlayingFinished = TRUE;
 							m_asActiveSamples[j].m_nSampleIndex = NO_SAMPLE;
 							m_asActiveSamples[j].m_nEntityIndex = AEHANDLE_NONE;
 							continue;
 						}
 					}
-					sample.m_bIsProcessed = TRUE;
-					m_asActiveSamples[j].m_bIsProcessed = TRUE;
+					sample.m_bIsBeingPlayed = TRUE;
+					m_asActiveSamples[j].m_bIsBeingPlayed = TRUE;
 					sample.m_nVolumeChange = -1;
-					if (!sample.m_bReleasingSoundFlag) {
+					if (!sample.m_bStatic) {
 						if (sample.m_bIs2D) {
-#ifdef EXTERNAL_3D_SOUND
-							emittingVol = m_bDoubleVolume ? 2 * Min(63, sample.m_nEmittingVolume) : sample.m_nEmittingVolume;
+							emittingVol = m_bDoubleVolume ? 2 * Min(63, sample.WORKING_VOLUME_FIELD) : sample.WORKING_VOLUME_FIELD;
+#ifdef USE_TIME_SCALE_FOR_AUDIO
+							SampleManager.SetChannelFrequency(j, sample.m_nFrequency * timeScale);
 #else
-							emittingVol = m_bDoubleVolume ? 2 * Min(63, sample.m_nVolume) : sample.m_nVolume;
-#endif
 							SampleManager.SetChannelFrequency(j, sample.m_nFrequency);
+#endif
 #ifdef EXTERNAL_3D_SOUND
 							SampleManager.SetChannelEmittingVolume(j, emittingVol);
 #else
-							SampleManager.SetChannelPan(j, sample.m_nOffset);
+							SampleManager.SetChannelPan(j, sample.m_nPan);
 							SampleManager.SetChannelVolume(j, sample.m_nVolume);
 #endif
 						} else {
@@ -870,7 +1017,11 @@ cAudioManager::ProcessActiveQueues()
 							if (sample.m_nFrequency != m_asActiveSamples[j].m_nFrequency) {
 								uint32 freq = Clamp2((int32)sample.m_nFrequency, (int32)m_asActiveSamples[j].m_nFrequency, 6000);
 								m_asActiveSamples[j].m_nFrequency = freq;
+#ifdef USE_TIME_SCALE_FOR_AUDIO
+								SampleManager.SetChannelFrequency(j, freq * timeScale);
+#else
 								SampleManager.SetChannelFrequency(j, freq);
+#endif
 							}
 
 #ifdef EXTERNAL_3D_SOUND
@@ -883,76 +1034,86 @@ cAudioManager::ProcessActiveQueues()
 							if (sample.m_nVolume != m_asActiveSamples[j].m_nVolume) {
 								vol = Clamp2((int8)sample.m_nVolume, (int8)m_asActiveSamples[j].m_nVolume, 10);
 								m_asActiveSamples[j].m_nVolume = vol;
-								SampleManager.SetChannelVolume(j, m_bDoubleVolume ? 2 * Min(63, vol) : vol);
 							}
+							SampleManager.SetChannelVolume(j, m_bDoubleVolume ? 2 * Min(63, m_asActiveSamples[j].m_nVolume) : m_asActiveSamples[j].m_nVolume);
 #endif
 							TranslateEntity(&sample.m_vecPos, &position);
 #ifdef EXTERNAL_3D_SOUND
 							SampleManager.SetChannel3DPosition(j, position.x, position.y, position.z);
-							SampleManager.SetChannel3DDistances(j, sample.m_SoundIntensity, 0.25f * sample.m_SoundIntensity);
+							SampleManager.SetChannel3DDistances(j, sample.m_MaxDistance, 0.25f * sample.m_MaxDistance);
 #else
-							sample.m_nOffset = ComputePan(sample.m_fDistance, &position);
-							SampleManager.SetChannelPan(j, sample.m_nOffset);
+							sample.m_nPan = ComputePan(sample.m_fDistance, &position);
+							SampleManager.SetChannelPan(j, sample.m_nPan);
 #endif
 						}
-						SampleManager.SetChannelReverbFlag(j, sample.m_bReverbFlag);
+						SampleManager.SetChannelReverbFlag(j, sample.m_bReverb);
 						break;
 					}
-					sample.m_bIsProcessed = FALSE;
-					m_asActiveSamples[j].m_bIsProcessed = FALSE;
+					sample.m_bIsBeingPlayed = FALSE;
+					m_asActiveSamples[j].m_bIsBeingPlayed = FALSE;
 				}
 			}
 		}
 	}
-	for (int32 i = 0; i < m_nActiveSamples; i++) {
-		if (m_asActiveSamples[i].m_nSampleIndex != NO_SAMPLE && !m_asActiveSamples[i].m_bIsProcessed) {
+	for (uint8 i = 0; i < m_nActiveSamples; i++) {
+		if (m_asActiveSamples[i].m_nSampleIndex != NO_SAMPLE && !m_asActiveSamples[i].m_bIsBeingPlayed) {
 			SampleManager.StopChannel(i);
 			m_asActiveSamples[i].m_nSampleIndex = NO_SAMPLE;
 			m_asActiveSamples[i].m_nEntityIndex = AEHANDLE_NONE;
 		}
 	}
-	for (uint8 i = 0; i < m_SampleRequestQueuesStatus[m_nActiveSampleQueue]; i++) {
-		tSound &sample = m_asSamples[m_nActiveSampleQueue][m_abSampleQueueIndexTable[m_nActiveSampleQueue][i]];
-		if (!sample.m_bIsProcessed && !sample.m_bLoopEnded && m_asAudioEntities[sample.m_nEntityIndex].m_bIsUsed && sample.m_nSampleIndex < NO_SAMPLE) {
-			if (sample.m_nCounter > 255 && sample.m_nLoopCount != 0 && sample.m_nLoopsRemaining != 0) {
-				sample.m_nLoopsRemaining--;
-				sample.m_nReleasingVolumeDivider = 1;
-			} else {
+	for (uint8 i = 0; i < m_nRequestedCount[m_nActiveQueue]; i++) {
+		tSound &sample = m_aRequestedQueue[m_nActiveQueue][m_aRequestedOrderList[m_nActiveQueue][i]];
+		if (!sample.m_bIsBeingPlayed && !sample.m_bIsPlayingFinished && m_asAudioEntities[sample.m_nEntityIndex].m_bIsUsed && sample.m_nSampleIndex < NO_SAMPLE) {
+#ifdef AUDIO_REFLECTIONS
+			if (sample.m_nCounter > 255 && sample.m_nLoopCount > 0 && sample.m_nReflectionDelay > 0) { // check if reflection
+				sample.m_nReflectionDelay--;
+				sample.m_nFramesToPlay = 1;
+			} else
+#endif
+			{
 				for (uint8 j = 0; j < m_nActiveSamples; j++) {
-					if (!m_asActiveSamples[j].m_bIsProcessed) {
-						if (sample.m_nLoopCount != 0) {
+					if (!m_asActiveSamples[j].m_bIsBeingPlayed) {
+						if (sample.m_nLoopCount > 0) {
 							samplesPerFrame = sample.m_nFrequency / m_nTimeSpent;
 							samplesToPlay = sample.m_nLoopCount * SampleManager.GetSampleLength(sample.m_nSampleIndex);
 							if (samplesPerFrame == 0)
 								continue;
-							sample.m_nReleasingVolumeDivider = samplesToPlay / samplesPerFrame + 1;
+							sample.m_nFramesToPlay = samplesToPlay / samplesPerFrame + 1;
 						}
 						memcpy(&m_asActiveSamples[j], &sample, sizeof(tSound));
 						if (!m_asActiveSamples[j].m_bIs2D) {
 							TranslateEntity(&m_asActiveSamples[j].m_vecPos, &position);
 #ifndef EXTERNAL_3D_SOUND
-							m_asActiveSamples[j].m_nOffset = ComputePan(m_asActiveSamples[j].m_fDistance, &position);
+							m_asActiveSamples[j].m_nPan = ComputePan(m_asActiveSamples[j].m_fDistance, &position);
 #endif
 						}
-#ifdef EXTERNAL_3D_SOUND
-						emittingVol = m_bDoubleVolume ? 2 * Min(63, m_asActiveSamples[j].m_nEmittingVolume) : m_asActiveSamples[j].m_nEmittingVolume;
+						emittingVol = m_bDoubleVolume ? 2 * Min(63, m_asActiveSamples[j].WORKING_VOLUME_FIELD) : m_asActiveSamples[j].WORKING_VOLUME_FIELD;
+#ifdef GTA_PS2
+						{
+							SampleManager.InitialiseChannel(j, m_asActiveSamples[j].m_nSampleIndex, m_asActiveSamples[j].m_nBankIndex);
 #else
-						emittingVol = m_bDoubleVolume ? 2 * Min(63, m_asActiveSamples[j].m_nVolume) : m_asActiveSamples[j].m_nVolume;
-#endif
 						if (SampleManager.InitialiseChannel(j, m_asActiveSamples[j].m_nSampleIndex, m_asActiveSamples[j].m_nBankIndex)) {
+#endif
+#ifdef USE_TIME_SCALE_FOR_AUDIO
+							SampleManager.SetChannelFrequency(j, m_asActiveSamples[j].m_nFrequency * timeScale);
+#else
 							SampleManager.SetChannelFrequency(j, m_asActiveSamples[j].m_nFrequency);
+#endif
 #ifdef EXTERNAL_3D_SOUND
 							SampleManager.SetChannelEmittingVolume(j, emittingVol);
 #else
 							SampleManager.SetChannelVolume(j, emittingVol);
-							SampleManager.SetChannelPan(j, m_asActiveSamples[j].m_nOffset);
+							SampleManager.SetChannelPan(j, m_asActiveSamples[j].m_nPan);
 #endif
+#ifndef GTA_PS2
 							SampleManager.SetChannelLoopPoints(j, m_asActiveSamples[j].m_nLoopStart, m_asActiveSamples[j].m_nLoopEnd);
+#endif
 							SampleManager.SetChannelLoopCount(j, m_asActiveSamples[j].m_nLoopCount);
-							SampleManager.SetChannelReverbFlag(j, m_asActiveSamples[j].m_bReverbFlag);
+							SampleManager.SetChannelReverbFlag(j, m_asActiveSamples[j].m_bReverb);
 #ifdef EXTERNAL_3D_SOUND
 							if (m_asActiveSamples[j].m_bIs2D) {
-								uint8 offset = m_asActiveSamples[j].m_nOffset;
+								uint8 offset = m_asActiveSamples[j].m_nPan;
 								if (offset == 63)
 									x = 0.f;
 								else if (offset >= 63)
@@ -962,19 +1123,19 @@ cAudioManager::ProcessActiveQueues()
 								usedX = x;
 								usedY = 0.0f;
 								usedZ = 0.0f;
-								m_asActiveSamples[j].m_SoundIntensity = 100000.0f;
+								m_asActiveSamples[j].m_MaxDistance = 100000.0f;
 							} else {
 								usedX = position.x;
 								usedY = position.y;
 								usedZ = position.z;
 							}
 							SampleManager.SetChannel3DPosition(j, usedX, usedY, usedZ);
-							SampleManager.SetChannel3DDistances(j, m_asActiveSamples[j].m_SoundIntensity, 0.25f * m_asActiveSamples[j].m_SoundIntensity);
+							SampleManager.SetChannel3DDistances(j, m_asActiveSamples[j].m_MaxDistance, 0.25f * m_asActiveSamples[j].m_MaxDistance);
 #endif
 							SampleManager.StartChannel(j);
 						}
-						m_asActiveSamples[j].m_bIsProcessed = TRUE;
-						sample.m_bIsProcessed = TRUE;
+						m_asActiveSamples[j].m_bIsBeingPlayed = TRUE;
+						sample.m_bIsBeingPlayed = TRUE;
 						sample.m_nVolumeChange = -1;
 						break;
 					}
@@ -982,15 +1143,23 @@ cAudioManager::ProcessActiveQueues()
 			}
 		}
 	}
+
+#ifdef USE_TIME_SCALE_FOR_AUDIO
+	for (uint8 i = 0; i < m_nActiveSamples; i++) {
+		if (m_asActiveSamples[i].m_nSampleIndex != NO_SAMPLE && m_asActiveSamples[i].m_bIsBeingPlayed)
+			SampleManager.SetChannelFrequency(i, m_asActiveSamples[i].m_nFrequency * timeScale);
+	}
+#endif
+
+	#undef WORKING_VOLUME_FIELD
 }
 
 void
 cAudioManager::ClearRequestedQueue()
 {
-	for (int32 i = 0; i < m_nActiveSamples; i++) {
-		m_abSampleQueueIndexTable[m_nActiveSampleQueue][i] = m_nActiveSamples;
-	}
-	m_SampleRequestQueuesStatus[m_nActiveSampleQueue] = 0;
+	for (uint8 i = 0; i < m_nActiveSamples; i++)
+		m_aRequestedOrderList[m_nActiveQueue][i] = m_nActiveSamples;
+	m_nRequestedCount[m_nActiveQueue] = 0;
 }
 
 void
@@ -1002,73 +1171,75 @@ cAudioManager::ClearActiveSamples()
 		m_asActiveSamples[i].m_nSampleIndex = NO_SAMPLE;
 		m_asActiveSamples[i].m_nBankIndex = INVALID_SFX_BANK;
 		m_asActiveSamples[i].m_bIs2D = FALSE;
-		m_asActiveSamples[i].m_nReleasingVolumeModificator = 5;
+		m_asActiveSamples[i].m_nPriority = 5;
 		m_asActiveSamples[i].m_nFrequency = 0;
 		m_asActiveSamples[i].m_nVolume = 0;
 #ifdef EXTERNAL_3D_SOUND
 		m_asActiveSamples[i].m_nEmittingVolume = 0;
 #endif
 		m_asActiveSamples[i].m_fDistance = 0.0f;
-		m_asActiveSamples[i].m_bIsProcessed = FALSE;
-		m_asActiveSamples[i].m_bLoopEnded = FALSE;
+		m_asActiveSamples[i].m_bIsBeingPlayed = FALSE;
+		m_asActiveSamples[i].m_bIsPlayingFinished = FALSE;
 		m_asActiveSamples[i].m_nLoopCount = 1;
 #ifndef GTA_PS2
 		m_asActiveSamples[i].m_nLoopStart = 0;
 		m_asActiveSamples[i].m_nLoopEnd = -1;
 #endif
 		m_asActiveSamples[i].m_fSpeedMultiplier = 0.0f;
-		m_asActiveSamples[i].m_SoundIntensity = 200.0f;
-		m_asActiveSamples[i].m_nOffset = 63;
-		m_asActiveSamples[i].m_bReleasingSoundFlag = FALSE;
+		m_asActiveSamples[i].m_MaxDistance = 200.0f;
+		m_asActiveSamples[i].m_nPan = 63;
+		m_asActiveSamples[i].m_bStatic = FALSE;
 #if GTA_VERSION < GTA3_PC_10
 		m_asActiveSamples[i].unk = -3;
 #endif
-		m_asActiveSamples[i].m_nCalculatedVolume = 0;
-		m_asActiveSamples[i].m_nReleasingVolumeDivider = 0;
+		m_asActiveSamples[i].m_nFinalPriority = 0;
+		m_asActiveSamples[i].m_nFramesToPlay = 0;
 		m_asActiveSamples[i].m_nVolumeChange = -1;
 		m_asActiveSamples[i].m_vecPos = CVector(0.0f, 0.0f, 0.0f);
-		m_asActiveSamples[i].m_bReverbFlag = FALSE;
-#if GTA_VERSION >= GTA3_PC_10
-		m_asActiveSamples[i].m_nLoopsRemaining = 0;
-		m_asActiveSamples[i].m_bRequireReflection = FALSE;
+		m_asActiveSamples[i].m_bReverb = FALSE;
+#ifdef AUDIO_REFLECTIONS
+		m_asActiveSamples[i].m_nReflectionDelay = 0;
+		m_asActiveSamples[i].m_bReflections = FALSE;
 #endif
 	}
-}
-
-void
-cAudioManager::LoadBankIfNecessary(uint8 bank)
-{
-	if(!SampleManager.IsSampleBankLoaded(bank))
-		SampleManager.LoadSampleBank(bank);
 }
 
 void
 cAudioManager::GenerateIntegerRandomNumberTable()
 {
-	for (int32 i = 0; i < ARRAY_SIZE(m_anRandomTable); i++) {
+	for (uint32 i = 0; i < ARRAY_SIZE(m_anRandomTable); i++)
 		m_anRandomTable[i] = myrand();
-	}
 }
+
+#ifdef GTA_PS2
+bool8
+cAudioManager::LoadBankIfNecessary(uint8 bank)
+{
+	if(!SampleManager.IsSampleBankLoaded(bank))
+		return SampleManager.LoadSampleBank(bank);
+	return FALSE;
+}
+#endif
 
 #ifdef EXTERNAL_3D_SOUND
 void
 cAudioManager::AdjustSamplesVolume()
 {
-	for (int i = 0; i < m_SampleRequestQueuesStatus[m_nActiveSampleQueue]; i++) {
-		tSound *pSample = &m_asSamples[m_nActiveSampleQueue][m_abSampleQueueIndexTable[m_nActiveSampleQueue][i]];
+	for (uint8 i = 0; i < m_nRequestedCount[m_nActiveQueue]; i++) {
+		tSound *pSample = &m_aRequestedQueue[m_nActiveQueue][m_aRequestedOrderList[m_nActiveQueue][i]];
 
 		if (!pSample->m_bIs2D)
-			pSample->m_nEmittingVolume = ComputeEmittingVolume(pSample->m_nEmittingVolume, pSample->m_SoundIntensity, pSample->m_fDistance);
+			pSample->m_nEmittingVolume = ComputeEmittingVolume(pSample->m_nEmittingVolume, pSample->m_MaxDistance, pSample->m_fDistance);
 	}
 }
 
 uint8
-cAudioManager::ComputeEmittingVolume(uint8 emittingVolume, float intensity, float dist)
+cAudioManager::ComputeEmittingVolume(uint8 emittingVolume, float maxDistance, float distance)
 {
-	float quatIntensity = intensity / 4.0f;
-	float diffIntensity = intensity - quatIntensity;
-	if (dist > diffIntensity)
-		return (quatIntensity - (dist - diffIntensity)) * (float)emittingVolume / quatIntensity;
+	float minDistance = maxDistance / 4.0f;
+	float diffDistance = maxDistance - minDistance;
+	if (distance > diffDistance)
+		return (minDistance - (distance - diffDistance)) * (float)emittingVolume / minDistance;
 	return emittingVolume;
 }
 #endif

@@ -126,10 +126,9 @@ enum Config {
 	NUMINVISIBLEENTITIES = 150,
 
 	NUM_AUDIOENTITY_EVENTS = 4,
-	NUM_PED_COMMENTS_BANKS = 2,
 	NUM_PED_COMMENTS_SLOTS = 20,
 
-	NUM_SOUNDS_SAMPLES_BANKS = 2,
+	NUM_SOUND_QUEUES = 2,
 	NUM_AUDIOENTITIES = 200,
 
 	NUM_SCRIPT_MAX_ENTITIES = 40,
@@ -171,6 +170,7 @@ enum Config {
 #	define PS2_MENU
 #elif defined GTA_PC
 #	define EXTERNAL_3D_SOUND
+#	define AUDIO_REFLECTIONS
 #	ifndef GTA_HANDHELD
 #		define PC_PLAYER_CONTROLS	// mouse player/cam mode
 #	endif
@@ -429,6 +429,7 @@ enum Config {
 // Audio
 #define EXTERNAL_3D_SOUND // use external engine to simulate 3d audio spatialization. OpenAL would not work without it (because it works in a 3d space
                           // originally and making it work in 2d only requires more resource). Will not work on PS2
+#define AUDIO_REFLECTIONS // Enable audio reflections. Disabled on mobile, didn't exist yet on PS2.
 #define RADIO_SCROLL_TO_PREV_STATION
 #define AUDIO_CACHE
 #define PS2_AUDIO_CHANNELS // increases the maximum number of audio channels to PS2 value of 44 (PC has 28 originally)
@@ -436,6 +437,8 @@ enum Config {
 //#define AUDIO_OAL_USE_SNDFILE // use libsndfile to decode WAVs instead of our internal decoder
 #define AUDIO_OAL_USE_MPG123 // use mpg123 to support mp3 files
 #define PAUSE_RADIO_IN_FRONTEND // pause radio when game is paused
+#define ATTACH_RELEASING_SOUNDS_TO_ENTITIES // sounds would follow ped and vehicles coordinates if not being queued otherwise
+#define USE_TIME_SCALE_FOR_AUDIO // slow down/speed up sounds according to the speed of the game
 #define MULTITHREADED_AUDIO // for streams. requires C++11 or later
 
 #ifdef AUDIO_OPUS
@@ -489,4 +492,7 @@ enum Config {
 #endif
 #if defined(GTA_PS2) && defined(EXTERNAL_3D_SOUND)
 #error EXTERNAL_3D_SOUND cannot work on PS2
+#endif
+#if defined(AUDIO_REFLECTIONS) && GTA_VERSION < GTA3_PC_10
+#error AUDIO_REFLECTIONS cannot work with versions below GTA3_PC_10
 #endif
